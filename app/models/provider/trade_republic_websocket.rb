@@ -3,6 +3,7 @@ require "net/http"
 require "openssl"
 require "socket"
 require "timeout"
+require "uri"
 require "websocket/driver"
 
 class Provider::TradeRepublicWebsocket
@@ -18,7 +19,8 @@ class Provider::TradeRepublicWebsocket
   end
 
   def connect
-    tcp = Socket.tcp(HOST, 443, connect_timeout: @timeout)
+    tcp = open_tunnel
+    @socket = tcp
     context = OpenSSL::SSL::SSLContext.new
     context.set_params
     @socket = OpenSSL::SSL::SSLSocket.new(tcp, context)
@@ -73,6 +75,61 @@ class Provider::TradeRepublicWebsocket
   end
 
   private
+
+    PROXY_RESPONSE_LIMIT = 16_384
+
+    def open_tunnel
+      proxy = proxy_uri
+      return Socket.tcp(HOST, 443, connect_timeout: @timeout) unless proxy
+
+      socket = Socket.tcp(proxy.hostname, proxy.port, connect_timeout: @timeout)
+      begin
+        socket.write(
+          "CONNECT #{HOST}:443 HTTP/1.1\r\n" \
+          "Host: #{HOST}:443\r\n\r\n"
+        )
+        read_proxy_response(socket)
+        socket
+      rescue StandardError
+        socket.close
+        raise
+      end
+    end
+
+    def proxy_uri
+      proxy = URI.parse("https://#{HOST}").find_proxy
+      return unless proxy
+
+      unless proxy.scheme == "http"
+        raise Provider::TradeRepublicClient::ConfigurationError,
+              "Unsupported Trade Republic WebSocket proxy scheme"
+      end
+
+      proxy
+    rescue URI::InvalidURIError
+      raise Provider::TradeRepublicClient::ConfigurationError,
+            "Invalid Trade Republic WebSocket proxy configuration"
+    end
+
+    def read_proxy_response(socket)
+      response = +""
+      Timeout.timeout(@timeout, Timeout::Error) do
+        while response.bytesize < PROXY_RESPONSE_LIMIT
+          response << socket.readpartial(1024)
+          break if response.include?("\r\n\r\n")
+        end
+      end
+
+      if response.bytesize >= PROXY_RESPONSE_LIMIT || !response.match?(/\AHTTP\/1\.[01] 2\d\d\b/)
+        raise Provider::TradeRepublicClient::TransientProviderError,
+              "Trade Republic WebSocket proxy rejected CONNECT"
+      end
+
+      response
+    rescue EOFError, IOError => e
+      raise Provider::TradeRepublicClient::TransientProviderError,
+            "Trade Republic WebSocket proxy closed during CONNECT: #{e.class}"
+    end
 
     def read_until
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @timeout
